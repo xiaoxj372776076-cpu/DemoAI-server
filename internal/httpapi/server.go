@@ -268,7 +268,7 @@ func (a *api) runJob(jobID string) {
 			current.Stage = "failed"
 			current.Progress = 100
 			current.CompletedAt = &completedAt
-			current.Error = &apiError{Code: "asr_failed", Message: "ASR processing failed. Check the server log for details."}
+			current.Error = &apiError{Code: "asr_failed", Message: "ASR 转写失败，请查看服务端日志。"}
 		})
 		return
 	}

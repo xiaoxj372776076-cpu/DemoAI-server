@@ -93,6 +93,43 @@ type apiError struct {
 	Message string `json:"message"`
 }
 
+type productItem struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	URL         string `json:"url,omitempty"`
+	Enabled     bool   `json:"enabled"`
+}
+
+type productCatalog struct {
+	Items []productItem `json:"items"`
+}
+
+type operatorPricing struct {
+	Currency string  `json:"currency"`
+	Amount   float64 `json:"amount"`
+	Unit     string  `json:"unit"`
+	Display  string  `json:"display"`
+	Note     string  `json:"note"`
+}
+
+type operatorDefinition struct {
+	ID                 string          `json:"id"`
+	Name               string          `json:"name"`
+	Category           string          `json:"category"`
+	Description        string          `json:"description"`
+	LongDescription    string          `json:"long_description"`
+	URL                string          `json:"url"`
+	Available          bool            `json:"available"`
+	AcceptedExtensions []string        `json:"accepted_extensions"`
+	MaxUploadBytes     int64           `json:"max_upload_bytes"`
+	Pricing            operatorPricing `json:"pricing"`
+}
+
+type operatorCatalog struct {
+	Items []operatorDefinition `json:"items"`
+}
+
 func New(config Config, logger *slog.Logger) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
@@ -112,6 +149,9 @@ func New(config Config, logger *slog.Logger) http.Handler {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", app.health)
+	mux.HandleFunc("GET /api/v1/catalog/products", app.getProducts)
+	mux.HandleFunc("GET /api/v1/operators", app.getOperators)
+	mux.HandleFunc("GET /api/v1/operators/{id}", app.getOperator)
 	mux.HandleFunc("POST /api/v1/jobs", app.createJob)
 	mux.HandleFunc("GET /api/v1/jobs/{id}", app.getJob)
 	mux.HandleFunc("GET /api/v1/jobs/{id}/artifacts/transcript", app.getTranscript)
@@ -128,6 +168,65 @@ func (a *api) health(w http.ResponseWriter, _ *http.Request) {
 		"service": "demoai-asr",
 		"ready":   a.transcriber != nil && a.dataRoot != ".",
 	})
+}
+
+func (a *api) getProducts(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, productCatalog{Items: []productItem{
+		{
+			ID:          "data-engine",
+			Name:        "数据引擎",
+			Description: "采集、治理与交付全链路",
+			Enabled:     false,
+		},
+		{
+			ID:          "model-evaluation",
+			Name:        "模型评测",
+			Description: "从能力到安全的系统评估",
+			Enabled:     false,
+		},
+		{
+			ID:          "operator-marketplace",
+			Name:        "算子广场",
+			Description: "浏览并运行可用的数据处理算子",
+			URL:         "/operators.html",
+			Enabled:     true,
+		},
+	}})
+}
+
+func (a *api) getOperators(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, operatorCatalog{Items: []operatorDefinition{a.asrOperator()}})
+}
+
+func (a *api) getOperator(w http.ResponseWriter, r *http.Request) {
+	if r.PathValue("id") != "asr" {
+		writeAPIError(w, http.StatusNotFound, "operator_not_found", "The requested operator does not exist.")
+		return
+	}
+	writeJSON(w, http.StatusOK, a.asrOperator())
+}
+
+func (a *api) asrOperator() operatorDefinition {
+	return operatorDefinition{
+		ID:              "asr",
+		Name:            "ASR 语音转写",
+		Category:        "音视频理解",
+		Description:     "把视频或音频中的语音转换为带时间戳的结构化文本。",
+		LongDescription: "基于 DemoAI-data 的 Whisper 算子完成语种识别、分段转写与 JSON 结果交付。",
+		URL:             "/asr.html",
+		Available:       a.transcriber != nil,
+		AcceptedExtensions: []string{
+			".mp4", ".mov", ".mkv", ".webm", ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg",
+		},
+		MaxUploadBytes: a.maxUploadBytes,
+		Pricing: operatorPricing{
+			Currency: "CNY",
+			Amount:   3,
+			Unit:     "media_hour",
+			Display:  "¥3.00 / 数据小时",
+			Note:     "按上传媒体的实际时长计费，本地演示不会产生真实费用。",
+		},
+	}
 }
 
 func (a *api) createJob(w http.ResponseWriter, r *http.Request) {

@@ -32,6 +32,18 @@ The server listens on port `8080` by default. Configuration:
 
 ### API
 
+Product navigation and operator metadata are owned by the backend:
+
+```text
+GET /api/v1/catalog/products
+GET /api/v1/operators
+GET /api/v1/operators/asr
+```
+
+The ASR catalog response includes availability, supported extensions, upload
+limits, and the demo price of `CNY 3.00` per media hour. Pricing is informational
+in the local demo and does not trigger billing.
+
 Create a job with multipart form data:
 
 ```http

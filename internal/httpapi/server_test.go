@@ -47,6 +47,64 @@ func TestHealth(t *testing.T) {
 	}
 }
 
+func TestProductCatalogIncludesOperatorMarketplace(t *testing.T) {
+	server := newTestServer(t, fakeTranscriber{})
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/catalog/products", nil)
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	var payload productCatalog
+	decodeJSON(t, recorder, &payload)
+	if len(payload.Items) != 3 {
+		t.Fatalf("items = %+v", payload.Items)
+	}
+	marketplace := payload.Items[2]
+	if marketplace.ID != "operator-marketplace" || marketplace.URL != "/operators.html" || !marketplace.Enabled {
+		t.Fatalf("marketplace = %+v", marketplace)
+	}
+}
+
+func TestOperatorCatalogReturnsASRWithBackendPricing(t *testing.T) {
+	server := newTestServer(t, fakeTranscriber{})
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/operators", nil)
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	var payload operatorCatalog
+	decodeJSON(t, recorder, &payload)
+	if len(payload.Items) != 1 {
+		t.Fatalf("items = %+v", payload.Items)
+	}
+	asr := payload.Items[0]
+	if asr.ID != "asr" || asr.URL != "/asr.html" || asr.Pricing.Amount != 3 || asr.MaxUploadBytes != 1<<20 {
+		t.Fatalf("asr = %+v", asr)
+	}
+}
+
+func TestOperatorDetailReturnsNotFoundForUnknownOperator(t *testing.T) {
+	server := newTestServer(t, fakeTranscriber{})
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/operators/unknown", nil)
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusNotFound)
+	}
+	payload := decodeResponse(t, recorder)
+	if payload.Error == nil || payload.Error.Code != "operator_not_found" {
+		t.Fatalf("payload = %+v", payload)
+	}
+}
+
 func TestCreateASRJobAndReadArtifact(t *testing.T) {
 	server := newTestServer(t, fakeTranscriber{})
 	request := uploadRequest(t, "sample.mp4", []byte("fake media"), "asr")

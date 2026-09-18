@@ -93,6 +93,117 @@ type apiError struct {
 	Message string `json:"message"`
 }
 
+// productItem is a single entry of the navigation product catalog. The web
+// front end owns no product copy of its own: it renders whatever the API
+// returns, so adding or hiding a product is a backend-only change.
+type productItem struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	URL         string `json:"url,omitempty"`
+	Enabled     bool   `json:"enabled"`
+}
+
+type productCatalog struct {
+	Success bool          `json:"success"`
+	Items   []productItem `json:"items"`
+}
+
+type operatorPricing struct {
+	Currency string  `json:"currency"`
+	Amount   float64 `json:"amount"`
+	Unit     string  `json:"unit"`
+	Display  string  `json:"display"`
+	Note     string  `json:"note,omitempty"`
+}
+
+type operatorDefinition struct {
+	ID                 string           `json:"id"`
+	Name               string           `json:"name"`
+	Category           string           `json:"category"`
+	Description        string           `json:"description"`
+	LongDescription    string           `json:"long_description,omitempty"`
+	URL                string           `json:"url,omitempty"`
+	Available          bool             `json:"available"`
+	AcceptedExtensions []string         `json:"accepted_extensions,omitempty"`
+	MaxUploadBytes     int64            `json:"max_upload_bytes,omitempty"`
+	Pricing            *operatorPricing `json:"pricing,omitempty"`
+}
+
+type operatorCatalog struct {
+	Success bool                 `json:"success"`
+	Items   []operatorDefinition `json:"items"`
+}
+
+// productCatalogData is the single source of truth for the navigation menu.
+func (a *api) productCatalogData() []productItem {
+	return []productItem{
+		{
+			ID:          "data-engine",
+			Name:        "数据引擎",
+			Description: "采集、治理与交付全链路",
+			Enabled:     false,
+		},
+		{
+			ID:          "model-evaluation",
+			Name:        "模型评测",
+			Description: "从能力到安全的系统评估",
+			Enabled:     false,
+		},
+		{
+			ID:          "agent-factory",
+			Name:        "Agent 工场",
+			Description: "面向复杂任务的环境构建",
+			Enabled:     false,
+		},
+		{
+			ID:          "operator-marketplace",
+			Name:        "算子广场",
+			Description: "浏览并运行可用的数据处理算子",
+			URL:         "operators.html",
+			Enabled:     true,
+		},
+	}
+}
+
+// operatorCatalogData lists the operators the server can actually run.
+func (a *api) operatorCatalogData() []operatorDefinition {
+	return []operatorDefinition{a.asrOperator()}
+}
+
+func (a *api) asrOperator() operatorDefinition {
+	return operatorDefinition{
+		ID:              "asr",
+		Name:            "ASR 语音转写",
+		Category:        "音视频理解",
+		Description:     "把视频或音频中的语音转换为带时间戳的结构化文本。",
+		LongDescription: "基于 DemoAI-data 的 Whisper 算子完成语种识别、分段转写与 JSON 结果交付。",
+		URL:             "index.html#playground",
+		Available:       a.transcriber != nil,
+		AcceptedExtensions: []string{
+			".aac", ".flac", ".m4a", ".mkv", ".mov",
+			".mp3", ".mp4", ".ogg", ".wav", ".webm",
+		},
+		MaxUploadBytes: a.maxUploadBytes,
+		Pricing: &operatorPricing{
+			Currency: "CNY",
+			Amount:   3,
+			Unit:     "media_hour",
+			Display:  "¥3.00 / 数据小时",
+			Note:     "按上传媒体的实际时长计费，本地演示不会产生真实费用。",
+		},
+	}
+}
+
+func (a *api) operatorByID(id string) (operatorDefinition, bool) {
+	for _, item := range a.operatorCatalogData() {
+		if item.ID == id {
+			return item, true
+		}
+	}
+	return operatorDefinition{}, false
+}
+
 func New(config Config, logger *slog.Logger) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
@@ -112,6 +223,9 @@ func New(config Config, logger *slog.Logger) http.Handler {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", app.health)
+	mux.HandleFunc("GET /api/v1/catalog/products", app.getProducts)
+	mux.HandleFunc("GET /api/v1/operators", app.getOperators)
+	mux.HandleFunc("GET /api/v1/operators/{id}", app.getOperator)
 	mux.HandleFunc("POST /api/v1/jobs", app.createJob)
 	mux.HandleFunc("GET /api/v1/jobs/{id}", app.getJob)
 	mux.HandleFunc("GET /api/v1/jobs/{id}/artifacts/transcript", app.getTranscript)
@@ -128,6 +242,23 @@ func (a *api) health(w http.ResponseWriter, _ *http.Request) {
 		"service": "demoai-asr",
 		"ready":   a.transcriber != nil && a.dataRoot != ".",
 	})
+}
+
+func (a *api) getProducts(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, productCatalog{Success: true, Items: a.productCatalogData()})
+}
+
+func (a *api) getOperators(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, operatorCatalog{Success: true, Items: a.operatorCatalogData()})
+}
+
+func (a *api) getOperator(w http.ResponseWriter, r *http.Request) {
+	item, ok := a.operatorByID(r.PathValue("id"))
+	if !ok {
+		writeAPIError(w, http.StatusNotFound, "operator_not_found", "The requested operator does not exist.")
+		return
+	}
+	writeJSON(w, http.StatusOK, item)
 }
 
 func (a *api) createJob(w http.ResponseWriter, r *http.Request) {

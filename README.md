@@ -2,6 +2,24 @@
 
 Backend services for the DemoAI website.
 
+## Catalog APIs
+
+The web frontend renders no product or operator copy of its own: it fetches the
+navigation and operator catalogs from this service, so adding, renaming, or
+hiding an entry is a backend-only change.
+
+```http
+GET /api/v1/catalog/products   # navigation product menu
+GET /api/v1/operators          # operator marketplace cards
+GET /api/v1/operators/{id}     # single operator definition
+```
+
+Products carry `id`, `name`, `description`, `url`, and `enabled`. A product is
+only linked when it is both enabled and has a URL; the `operator-marketplace`
+entry is what exposes the 算子广场 page. Operators carry their availability,
+accepted extensions, upload limit, and pricing, so the frontend never hard-codes
+upload rules.
+
 ## ASR playground
 
 The website can upload a video or audio file and start an asynchronous ASR job.

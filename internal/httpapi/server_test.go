@@ -47,6 +47,101 @@ func TestHealth(t *testing.T) {
 	}
 }
 
+func TestProductCatalogIsRenderedFromBackend(t *testing.T) {
+	server := newTestServer(t, fakeTranscriber{})
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/catalog/products", nil)
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	var payload productCatalog
+	decodeJSON(t, recorder, &payload)
+	if !payload.Success {
+		t.Fatalf("success = false, want true")
+	}
+	if len(payload.Items) != 4 {
+		t.Fatalf("items = %+v", payload.Items)
+	}
+
+	var marketplace *productItem
+	for i := range payload.Items {
+		if payload.Items[i].ID == "operator-marketplace" {
+			marketplace = &payload.Items[i]
+		}
+	}
+	if marketplace == nil {
+		t.Fatal("product catalog is missing the operator marketplace entry")
+	}
+	if marketplace.Name != "算子广场" || marketplace.URL != "operators.html" || !marketplace.Enabled {
+		t.Fatalf("marketplace = %+v", marketplace)
+	}
+	for _, item := range payload.Items {
+		if item.Enabled && item.URL == "" {
+			t.Fatalf("enabled product %q has no URL", item.ID)
+		}
+	}
+}
+
+func TestOperatorCatalogReturnsASRWithBackendRules(t *testing.T) {
+	server := newTestServer(t, fakeTranscriber{})
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/operators", nil)
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	var payload operatorCatalog
+	decodeJSON(t, recorder, &payload)
+	if len(payload.Items) != 1 {
+		t.Fatalf("items = %+v", payload.Items)
+	}
+	asr := payload.Items[0]
+	if asr.ID != "asr" || asr.URL != "index.html#playground" {
+		t.Fatalf("asr = %+v", asr)
+	}
+	if !asr.Available {
+		t.Fatal("asr operator should be available when a transcriber is configured")
+	}
+	if asr.MaxUploadBytes != 1<<20 {
+		t.Fatalf("max_upload_bytes = %d, want %d", asr.MaxUploadBytes, 1<<20)
+	}
+	if asr.Pricing == nil || asr.Pricing.Amount != 3 || asr.Pricing.Currency != "CNY" {
+		t.Fatalf("pricing = %+v", asr.Pricing)
+	}
+	if len(asr.AcceptedExtensions) != len(allowedMediaExtensions) {
+		t.Fatalf("accepted_extensions = %+v", asr.AcceptedExtensions)
+	}
+}
+
+func TestOperatorDetail(t *testing.T) {
+	server := newTestServer(t, fakeTranscriber{})
+
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/operators/asr", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	var detail operatorDefinition
+	decodeJSON(t, recorder, &detail)
+	if detail.ID != "asr" {
+		t.Fatalf("detail = %+v", detail)
+	}
+
+	missing := httptest.NewRecorder()
+	server.ServeHTTP(missing, httptest.NewRequest(http.MethodGet, "/api/v1/operators/unknown", nil))
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", missing.Code, http.StatusNotFound)
+	}
+	if payload := decodeResponse(t, missing); payload.Error == nil || payload.Error.Code != "operator_not_found" {
+		t.Fatalf("payload = %+v", payload)
+	}
+}
+
 func TestCreateASRJobAndReadArtifact(t *testing.T) {
 	server := newTestServer(t, fakeTranscriber{})
 	request := uploadRequest(t, "sample.mp4", []byte("fake media"), "asr")

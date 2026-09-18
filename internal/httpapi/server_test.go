@@ -30,6 +30,29 @@ func (f fakeTranscriber) Transcribe(_ context.Context, inputPath, outputPath str
 	return os.WriteFile(outputPath, []byte(`{"language":"zh","text":"测试转写","segments":[]}`), 0o644)
 }
 
+type fakeHandPose struct {
+	err error
+}
+
+func (f fakeHandPose) Estimate(_ context.Context, inputPath, outputDirectory string) (string, string, error) {
+	if f.err != nil {
+		return "", "", f.err
+	}
+	if _, err := os.Stat(inputPath); err != nil {
+		return "", "", err
+	}
+	stem := strings.TrimSuffix(filepath.Base(inputPath), filepath.Ext(inputPath))
+	videoPath := filepath.Join(outputDirectory, stem+"_hand_pose.mp4")
+	keypointsPath := filepath.Join(outputDirectory, stem+"_hand_keypoints.json")
+	if err := os.WriteFile(videoPath, []byte("fake mp4"), 0o644); err != nil {
+		return "", "", err
+	}
+	if err := os.WriteFile(keypointsPath, []byte(`{"metadata":{"frame_count":1},"frames":[]}`), 0o644); err != nil {
+		return "", "", err
+	}
+	return videoPath, keypointsPath, nil
+}
+
 func TestHealth(t *testing.T) {
 	server := newTestServer(t, fakeTranscriber{})
 	request := httptest.NewRequest(http.MethodGet, "/healthz", nil)
@@ -97,7 +120,7 @@ func TestOperatorCatalogReturnsASRWithBackendRules(t *testing.T) {
 	}
 	var payload operatorCatalog
 	decodeJSON(t, recorder, &payload)
-	if len(payload.Items) != 1 {
+	if len(payload.Items) != 2 {
 		t.Fatalf("items = %+v", payload.Items)
 	}
 	asr := payload.Items[0]
@@ -115,6 +138,43 @@ func TestOperatorCatalogReturnsASRWithBackendRules(t *testing.T) {
 	}
 	if len(asr.AcceptedExtensions) != len(allowedMediaExtensions) {
 		t.Fatalf("accepted_extensions = %+v", asr.AcceptedExtensions)
+	}
+
+	handPose := payload.Items[1]
+	if handPose.ID != "hand_pose" || handPose.URL != "handpose.html" {
+		t.Fatalf("hand pose = %+v", handPose)
+	}
+	if handPose.Pricing == nil || handPose.Pricing.Currency != "CNY" {
+		t.Fatalf("hand pose pricing = %+v", handPose.Pricing)
+	}
+	// Audio-only containers make no sense for a frame decoder, so the hand
+	// pose operator must publish a narrower extension list.
+	if len(handPose.AcceptedExtensions) != len(allowedVideoExtensions) {
+		t.Fatalf("hand pose accepted_extensions = %+v", handPose.AcceptedExtensions)
+	}
+	for _, extension := range handPose.AcceptedExtensions {
+		if !allowedVideoExtensions[extension] {
+			t.Fatalf("hand pose advertises non-video extension %q", extension)
+		}
+	}
+}
+
+func TestHandPoseAvailabilityFollowsConfiguration(t *testing.T) {
+	without := newTestServer(t, fakeTranscriber{})
+	recorder := httptest.NewRecorder()
+	without.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/operators/hand_pose", nil))
+	var detail operatorDefinition
+	decodeJSON(t, recorder, &detail)
+	if detail.Available {
+		t.Fatal("hand pose should be unavailable when no estimator is configured")
+	}
+
+	with := newTestServerWithHandPose(t, fakeTranscriber{}, fakeHandPose{})
+	recorder = httptest.NewRecorder()
+	with.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/operators/hand_pose", nil))
+	decodeJSON(t, recorder, &detail)
+	if !detail.Available {
+		t.Fatal("hand pose should be available when an estimator is configured")
 	}
 }
 
@@ -178,7 +238,7 @@ func TestCreateASRJobAndReadArtifact(t *testing.T) {
 
 func TestCreateJobRejectsUnsupportedOperator(t *testing.T) {
 	server := newTestServer(t, fakeTranscriber{})
-	request := uploadRequest(t, "sample.mp4", []byte("fake media"), "hand_pose")
+	request := uploadRequest(t, "sample.mp4", []byte("fake media"), "not_an_operator")
 	recorder := httptest.NewRecorder()
 
 	server.ServeHTTP(recorder, request)
@@ -189,6 +249,119 @@ func TestCreateJobRejectsUnsupportedOperator(t *testing.T) {
 	payload := decodeResponse(t, recorder)
 	if payload.Error == nil || payload.Error.Code != "unsupported_operator" {
 		t.Fatalf("payload = %+v", payload)
+	}
+}
+
+func TestCreateHandPoseJobRejectsUnknownOperator(t *testing.T) {
+	server := newTestServerWithHandPose(t, fakeTranscriber{}, fakeHandPose{})
+	request := uploadRequest(t, "sample.mp4", []byte("fake media"), "not_an_operator")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+}
+
+func TestCreateHandPoseJobWithoutEstimatorIsUnavailable(t *testing.T) {
+	server := newTestServer(t, fakeTranscriber{})
+	request := uploadRequest(t, "sample.mp4", []byte("fake media"), "hand_pose")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+	}
+	payload := decodeResponse(t, recorder)
+	if payload.Error == nil || payload.Error.Code != "hand_pose_unavailable" {
+		t.Fatalf("payload = %+v", payload)
+	}
+}
+
+func TestCreateHandPoseJobRejectsAudioOnlyUpload(t *testing.T) {
+	server := newTestServerWithHandPose(t, fakeTranscriber{}, fakeHandPose{})
+	request := uploadRequest(t, "voice.mp3", []byte("fake audio"), "hand_pose")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+	payload := decodeResponse(t, recorder)
+	if payload.Error == nil || payload.Error.Code != "unsupported_media" {
+		t.Fatalf("payload = %+v", payload)
+	}
+}
+
+func TestCreateHandPoseJobAndReadArtifacts(t *testing.T) {
+	server := newTestServerWithHandPose(t, fakeTranscriber{}, fakeHandPose{})
+	request := uploadRequest(t, "hands.mp4", []byte("fake media"), "hand_pose")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusAccepted, recorder.Body.String())
+	}
+	var created job
+	decodeJSON(t, recorder, &created)
+	if created.Operator != "hand_pose" {
+		t.Fatalf("operator = %q, want hand_pose", created.Operator)
+	}
+
+	completed := waitForJob(t, server, created.ID)
+	if completed.Status != "succeeded" || completed.Artifacts == nil {
+		t.Fatalf("completed job = %+v", completed)
+	}
+	if completed.Artifacts.VideoURL == "" || completed.Artifacts.KeypointsURL == "" {
+		t.Fatalf("artifacts = %+v", completed.Artifacts)
+	}
+	if completed.Artifacts.TranscriptURL != "" {
+		t.Fatalf("hand pose job should not expose a transcript URL: %+v", completed.Artifacts)
+	}
+
+	videoRecorder := httptest.NewRecorder()
+	server.ServeHTTP(videoRecorder, httptest.NewRequest(http.MethodGet, completed.Artifacts.VideoURL, nil))
+	if videoRecorder.Code != http.StatusOK {
+		t.Fatalf("video status = %d", videoRecorder.Code)
+	}
+	if contentType := videoRecorder.Header().Get("Content-Type"); contentType != "video/mp4" {
+		t.Fatalf("content type = %q, want video/mp4", contentType)
+	}
+	if videoRecorder.Body.String() != "fake mp4" {
+		t.Fatalf("video body = %q", videoRecorder.Body.String())
+	}
+
+	keypointsRecorder := httptest.NewRecorder()
+	server.ServeHTTP(keypointsRecorder, httptest.NewRequest(http.MethodGet, completed.Artifacts.KeypointsURL, nil))
+	if keypointsRecorder.Code != http.StatusOK {
+		t.Fatalf("keypoints status = %d", keypointsRecorder.Code)
+	}
+	var keypoints map[string]any
+	decodeJSON(t, keypointsRecorder, &keypoints)
+	if _, ok := keypoints["frames"]; !ok {
+		t.Fatalf("keypoints = %+v", keypoints)
+	}
+}
+
+func TestFailedHandPoseJobReportsFailure(t *testing.T) {
+	server := newTestServerWithHandPose(t, fakeTranscriber{}, fakeHandPose{err: context.DeadlineExceeded})
+	request := uploadRequest(t, "hands.mp4", []byte("fake media"), "hand_pose")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	var created job
+	decodeJSON(t, recorder, &created)
+	completed := waitForJob(t, server, created.ID)
+	if completed.Status != "failed" {
+		t.Fatalf("status = %q, want failed", completed.Status)
+	}
+	if completed.Error == nil || completed.Error.Code != "hand_pose_failed" {
+		t.Fatalf("error = %+v", completed.Error)
 	}
 }
 
@@ -281,6 +454,18 @@ func newTestServer(t *testing.T, transcriber Transcriber) http.Handler {
 		DataRoot:       t.TempDir(),
 		MaxUploadBytes: 1 << 20,
 		Transcriber:    transcriber,
+	}, logger)
+}
+
+func newTestServerWithHandPose(t *testing.T, transcriber Transcriber, handPose HandPoseEstimator) http.Handler {
+	t.Helper()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	return New(Config{
+		AllowedOrigin:  "http://localhost:4173",
+		DataRoot:       t.TempDir(),
+		MaxUploadBytes: 1 << 20,
+		Transcriber:    transcriber,
+		HandPose:       handPose,
 	}, logger)
 }
 

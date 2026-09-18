@@ -22,6 +22,9 @@ const (
 	maxRequestBody = 1 << 20
 	plusUpgradeURL = "https://chatgpt.com/plans/plus/"
 	defaultMaxFile = 500 << 20
+
+	operatorASR      = "asr"
+	operatorHandPose = "hand_pose"
 )
 
 var allowedMediaExtensions = map[string]bool{
@@ -30,8 +33,20 @@ var allowedMediaExtensions = map[string]bool{
 	".wav": true, ".webm": true,
 }
 
+// The hand pose operator decodes frames, so audio-only containers are out.
+var allowedVideoExtensions = map[string]bool{
+	".mkv": true, ".mov": true, ".mp4": true, ".webm": true,
+}
+
 type Transcriber interface {
 	Transcribe(ctx context.Context, inputPath, outputPath string) error
+}
+
+// HandPoseEstimator runs the hand pose operator and reports where it put its
+// two artifacts. The paths are input-stem derived, so the caller receives
+// them rather than guessing.
+type HandPoseEstimator interface {
+	Estimate(ctx context.Context, inputPath, outputDirectory string) (videoPath, keypointsPath string, err error)
 }
 
 type Config struct {
@@ -39,6 +54,7 @@ type Config struct {
 	DataRoot       string
 	MaxUploadBytes int64
 	Transcriber    Transcriber
+	HandPose       HandPoseEstimator
 }
 
 type api struct {
@@ -46,6 +62,7 @@ type api struct {
 	dataRoot       string
 	maxUploadBytes int64
 	transcriber    Transcriber
+	handPose       HandPoseEstimator
 	jobs           *jobStore
 	logger         *slog.Logger
 }
@@ -63,10 +80,14 @@ type job struct {
 	Artifacts      *jobArtifacts `json:"artifacts,omitempty"`
 	inputPath      string
 	transcriptPath string
+	videoPath      string
+	keypointsPath  string
 }
 
 type jobArtifacts struct {
-	TranscriptURL string `json:"transcript_url"`
+	TranscriptURL string `json:"transcript_url,omitempty"`
+	VideoURL      string `json:"video_url,omitempty"`
+	KeypointsURL  string `json:"keypoints_url,omitempty"`
 }
 
 type jobStore struct {
@@ -168,12 +189,35 @@ func (a *api) productCatalogData() []productItem {
 
 // operatorCatalogData lists the operators the server can actually run.
 func (a *api) operatorCatalogData() []operatorDefinition {
-	return []operatorDefinition{a.asrOperator()}
+	return []operatorDefinition{a.asrOperator(), a.handPoseOperator()}
+}
+
+func (a *api) handPoseOperator() operatorDefinition {
+	return operatorDefinition{
+		ID:              operatorHandPose,
+		Name:            "手部位姿估计",
+		Category:        "视觉理解",
+		Description:     "跟踪视频中的双手，输出 21 个关节的关键点并合成骨架视频。",
+		LongDescription: "基于 DemoAI-data 的 HaWoR 时序算子完成手部检测、MANO 21 关节解码与骨架渲染，交付逐帧关键点 JSON 和合成视频。",
+		URL:             "handpose.html",
+		Available:       a.handPose != nil,
+		AcceptedExtensions: []string{
+			".mkv", ".mov", ".mp4", ".webm",
+		},
+		MaxUploadBytes: a.maxUploadBytes,
+		Pricing: &operatorPricing{
+			Currency: "CNY",
+			Amount:   6,
+			Unit:     "video_hour",
+			Display:  "¥6.00 / 数据小时",
+			Note:     "按上传视频的实际时长计费，本地演示不会产生真实费用。",
+		},
+	}
 }
 
 func (a *api) asrOperator() operatorDefinition {
 	return operatorDefinition{
-		ID:              "asr",
+		ID:              operatorASR,
 		Name:            "ASR 语音转写",
 		Category:        "音视频理解",
 		Description:     "把视频或音频中的语音转换为带时间戳的结构化文本。",
@@ -217,6 +261,7 @@ func New(config Config, logger *slog.Logger) http.Handler {
 		dataRoot:       filepath.Clean(config.DataRoot),
 		maxUploadBytes: config.MaxUploadBytes,
 		transcriber:    config.Transcriber,
+		handPose:       config.HandPose,
 		jobs:           &jobStore{jobs: make(map[string]job)},
 		logger:         logger,
 	}
@@ -229,6 +274,8 @@ func New(config Config, logger *slog.Logger) http.Handler {
 	mux.HandleFunc("POST /api/v1/jobs", app.createJob)
 	mux.HandleFunc("GET /api/v1/jobs/{id}", app.getJob)
 	mux.HandleFunc("GET /api/v1/jobs/{id}/artifacts/transcript", app.getTranscript)
+	mux.HandleFunc("GET /api/v1/jobs/{id}/artifacts/video", app.getVideo)
+	mux.HandleFunc("GET /api/v1/jobs/{id}/artifacts/keypoints", app.getKeypoints)
 	mux.HandleFunc("POST /api/v1/chatgpt-plus/upgrade", app.createUpgradeSession)
 	mux.HandleFunc("OPTIONS /api/v1/{path...}", app.preflight)
 
@@ -239,8 +286,12 @@ func (a *api) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"success": true,
 		"status":  "ok",
-		"service": "demoai-asr",
-		"ready":   a.transcriber != nil && a.dataRoot != ".",
+		"service": "demoai-operators",
+		"ready":   a.dataRoot != "." && (a.transcriber != nil || a.handPose != nil),
+		"operators": map[string]bool{
+			operatorASR:      a.transcriber != nil,
+			operatorHandPose: a.handPose != nil,
+		},
 	})
 }
 
@@ -262,11 +313,6 @@ func (a *api) getOperator(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *api) createJob(w http.ResponseWriter, r *http.Request) {
-	if a.transcriber == nil {
-		writeAPIError(w, http.StatusServiceUnavailable, "asr_unavailable", "ASR service is not configured.")
-		return
-	}
-
 	r.Body = http.MaxBytesReader(w, r.Body, a.maxUploadBytes+(2<<20))
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		var maxBytesError *http.MaxBytesError
@@ -283,11 +329,20 @@ func (a *api) createJob(w http.ResponseWriter, r *http.Request) {
 
 	operator := strings.TrimSpace(r.FormValue("operator"))
 	if operator == "" {
-		operator = "asr"
+		operator = operatorASR
 	}
-	if operator != "asr" {
-		writeAPIError(w, http.StatusBadRequest, "unsupported_operator", "Only the asr operator is available.")
+	definition, ok := a.operatorByID(operator)
+	if !ok {
+		writeAPIError(w, http.StatusBadRequest, "unsupported_operator", "The requested operator does not exist.")
 		return
+	}
+	if !definition.Available {
+		writeAPIError(w, http.StatusServiceUnavailable, definition.ID+"_unavailable", "This operator is not configured on the server.")
+		return
+	}
+	accepted := allowedMediaExtensions
+	if operator == operatorHandPose {
+		accepted = allowedVideoExtensions
 	}
 
 	upload, header, err := r.FormFile("file")
@@ -302,8 +357,8 @@ func (a *api) createJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	extension := strings.ToLower(filepath.Ext(header.Filename))
-	if !allowedMediaExtensions[extension] {
-		writeAPIError(w, http.StatusBadRequest, "unsupported_media", "Supported formats: MP4, MOV, MKV, WebM, MP3, WAV, M4A, AAC, FLAC, and OGG.")
+	if !accepted[extension] {
+		writeAPIError(w, http.StatusBadRequest, "unsupported_media", "Supported formats: "+strings.Join(definition.AcceptedExtensions, ", ")+".")
 		return
 	}
 
@@ -335,17 +390,22 @@ func (a *api) createJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	transcriptPath := filepath.Join(outputDirectory, "transcript.json")
 	created := job{
-		ID:             jobID,
-		Operator:       "asr",
-		OriginalName:   filepath.Base(header.Filename),
-		Status:         "queued",
-		Stage:          "queued",
-		Progress:       10,
-		CreatedAt:      time.Now().UTC(),
-		inputPath:      inputPath,
-		transcriptPath: transcriptPath,
+		ID:           jobID,
+		Operator:     operator,
+		OriginalName: filepath.Base(header.Filename),
+		Status:       "queued",
+		Stage:        "queued",
+		Progress:     10,
+		CreatedAt:    time.Now().UTC(),
+		inputPath:    inputPath,
+	}
+	switch operator {
+	case operatorHandPose:
+		created.videoPath = filepath.Join(outputDirectory, "source_hand_pose.mp4")
+		created.keypointsPath = filepath.Join(outputDirectory, "source_hand_keypoints.json")
+	default:
+		created.transcriptPath = filepath.Join(outputDirectory, "transcript.json")
 	}
 	a.jobs.put(created)
 	go a.runJob(jobID)
@@ -390,27 +450,98 @@ func (a *api) runJob(jobID string) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
 	defer cancel()
-	err := a.transcriber.Transcribe(ctx, item.inputPath, item.transcriptPath)
-	completedAt := time.Now().UTC()
+
+	var err error
+	switch item.Operator {
+	case operatorHandPose:
+		err = a.runHandPoseJob(ctx, jobID, item)
+	default:
+		err = a.transcriber.Transcribe(ctx, item.inputPath, item.transcriptPath)
+	}
 	if err != nil {
-		a.logger.Error("ASR job failed", "job_id", jobID, "error", err)
+		a.logger.Error("operator job failed", "job_id", jobID, "operator", item.Operator, "error", err)
+		completedAt := time.Now().UTC()
 		a.jobs.update(jobID, func(current *job) {
 			current.Status = "failed"
 			current.Stage = "failed"
 			current.Progress = 100
 			current.CompletedAt = &completedAt
-			current.Error = &apiError{Code: "asr_failed", Message: "ASR 转写失败，请查看服务端日志。"}
+			current.Error = &apiError{
+				Code:    item.Operator + "_failed",
+				Message: "算子执行失败，请查看服务端日志。",
+			}
 		})
 		return
 	}
 
+	completedAt := time.Now().UTC()
 	a.jobs.update(jobID, func(current *job) {
 		current.Status = "succeeded"
 		current.Stage = "completed"
 		current.Progress = 100
 		current.CompletedAt = &completedAt
-		current.Artifacts = &jobArtifacts{TranscriptURL: "/api/v1/jobs/" + jobID + "/artifacts/transcript"}
+		current.Artifacts = artifactsFor(jobID, current.Operator)
 	})
+}
+
+func (a *api) runHandPoseJob(ctx context.Context, jobID string, item job) error {
+	a.jobs.update(jobID, func(current *job) {
+		current.Stage = "estimating_hands"
+		current.Progress = 30
+	})
+	producedVideo, producedKeypoints, err := a.handPose.Estimate(ctx, item.inputPath, filepath.Dir(item.videoPath))
+	if err != nil {
+		return err
+	}
+	a.jobs.update(jobID, func(current *job) {
+		current.videoPath = producedVideo
+		current.keypointsPath = producedKeypoints
+	})
+	return nil
+}
+
+func artifactsFor(jobID, operator string) *jobArtifacts {
+	switch operator {
+	case operatorHandPose:
+		return &jobArtifacts{
+			VideoURL:     "/api/v1/jobs/" + jobID + "/artifacts/video",
+			KeypointsURL: "/api/v1/jobs/" + jobID + "/artifacts/keypoints",
+		}
+	default:
+		return &jobArtifacts{TranscriptURL: "/api/v1/jobs/" + jobID + "/artifacts/transcript"}
+	}
+}
+
+func (a *api) getVideo(w http.ResponseWriter, r *http.Request) {
+	item, ok := a.jobs.get(r.PathValue("id"))
+	if !ok {
+		writeAPIError(w, http.StatusNotFound, "job_not_found", "The requested job does not exist.")
+		return
+	}
+	if item.Status != "succeeded" || item.videoPath == "" {
+		writeAPIError(w, http.StatusConflict, "artifact_not_ready", "The rendered video is not ready.")
+		return
+	}
+	// ServeContent would otherwise keep the JSON content type set by the
+	// middleware, which breaks inline playback in the browser.
+	w.Header().Set("Content-Type", "video/mp4")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`inline; filename="%s-hand-pose.mp4"`, item.ID))
+	http.ServeFile(w, r, item.videoPath)
+}
+
+func (a *api) getKeypoints(w http.ResponseWriter, r *http.Request) {
+	item, ok := a.jobs.get(r.PathValue("id"))
+	if !ok {
+		writeAPIError(w, http.StatusNotFound, "job_not_found", "The requested job does not exist.")
+		return
+	}
+	if item.Status != "succeeded" || item.keypointsPath == "" {
+		writeAPIError(w, http.StatusConflict, "artifact_not_ready", "The keypoints are not ready.")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`inline; filename="%s-hand-keypoints.json"`, item.ID))
+	http.ServeFile(w, r, item.keypointsPath)
 }
 
 func (a *api) createUpgradeSession(w http.ResponseWriter, r *http.Request) {

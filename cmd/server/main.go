@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/xiaoxj372776076-cpu/DemoAI-server/internal/asr"
+	"github.com/xiaoxj372776076-cpu/DemoAI-server/internal/handpose"
 	"github.com/xiaoxj372776076-cpu/DemoAI-server/internal/httpapi"
 )
 
@@ -25,6 +26,8 @@ func main() {
 	python := envOrDefault("ASR_PYTHON", filepath.Join(dataRepository, ".venv312", "bin", "python"))
 	model := envOrDefault("ASR_MODEL", "mlx-community/whisper-small-mlx")
 	modelCache := envOrDefault("ASR_MODEL_CACHE", filepath.Join(dataRoot, "models", "asr"))
+	haworRoot := absolutePath(envOrDefault("HAND_POSE_HAWOR_ROOT", filepath.Join(dataRoot, "models", "hawor", "runtime")))
+	binDir := absolutePath(envOrDefault("DEMOAI_BIN_DIR", filepath.Join(filepath.Dir(dataRepository), ".bin")))
 	maxUploadBytes := envInt64OrDefault("MAX_UPLOAD_BYTES", 500<<20)
 
 	handler := httpapi.New(httpapi.Config{
@@ -37,6 +40,13 @@ func main() {
 			WorkingDir: dataRepository,
 			Model:      model,
 			ModelCache: modelCache,
+		},
+		HandPose: handpose.CommandRunner{
+			Python:     envOrDefault("HAND_POSE_PYTHON", python),
+			Script:     filepath.Join(dataRepository, "operators", "hand_pose", "estimate_hands.py"),
+			WorkingDir: dataRepository,
+			HaworRoot:  haworRoot,
+			BinDir:     binDir,
 		},
 	}, logger)
 
@@ -58,6 +68,8 @@ func main() {
 			"allowed_origin", origin,
 			"data_root", dataRoot,
 			"demoai_data_repo", dataRepository,
+			"hawor_root", haworRoot,
+			"bin_dir", binDir,
 		)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("server stopped unexpectedly", "error", err)
